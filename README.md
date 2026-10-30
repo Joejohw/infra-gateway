@@ -225,3 +225,60 @@ curl -fsS http://127.0.0.1:8088/healthz
 
 Preservar o diretório de rollback até concluir a observação. Nenhum desses
 procedimentos exige `down`, remoção de rede/volume ou novas portas.
+
+## CI de segurança do gateway
+
+`.github/workflows/ci.yaml` executa em PRs destinados a `main` e pushes em
+`main`, em runner hospedado Ubuntu 24.04. O job/check se chama
+`gateway-security`. O ruleset `protect-main` não foi alterado: para exigir esse
+check no merge, selecione-o como obrigatório no ruleset após sua primeira
+execução no GitHub.
+
+A única Action é checkout, fixada no SHA completo da
+[versão revisada](https://github.com/actions/checkout/commit/34e114876b0b11c390a56381ad16ebd13914f8d5),
+com `persist-credentials: false`. O token recebe somente `contents: read`;
+não há secrets, publicação ou deploy, nem evento `pull_request_target`.
+
+Para executar exatamente a validação local (Docker Engine Linux, Compose v2,
+Bash e acesso ao registry para baixar as imagens públicas):
+
+```sh
+bash tests/ci.sh
+git diff --check
+```
+
+O script valida Compose usando `--env-file /dev/null`, sem ler o `.env` local,
+sem executar `compose up` e sem criar/consultar `proxy_net`. Faz `nginx -t`
+sem rede, com os arquivos reais do repositório. Depois cria uma rede Docker
+`--internal` exclusiva, um backend Python sintético com alias `tesouraria-api`,
+um gateway e um runner de testes. Nenhuma porta é publicada. Todos usam UID/GID
+101, rootfs read-only, capabilities removidas e tmpfs em `/tmp`. O runner não
+recebe Docker socket nem credenciais. Não são usados API Quarkus, PostgreSQL,
+Mailpit ou dados reais; configurações de produção não são alteradas.
+
+O teste HTTP existente ganha `--fixture` para esperar prontidão e validar as
+respostas do backend sintético. Mantém os checks de saúde, default, 429 por
+rota/IP, headers falsificados, limite geral e corpo de 64 KiB. Na fixture,
+confirma também o encaminhamento exato de URI/query, método, corpo e headers
+de IP. O script verifica ausência dos sentinelas fictícios nos logs. Não é
+uma simulação da lógica de negócio da aplicação, nem um scanner de CVEs.
+As imagens `nginx:stable-alpine` e `python:3.13-alpine` são tags móveis;
+Actions estão fixadas por SHA, mas o resultado pode revelar mudanças nas imagens.
+
+Em falha, consultar a etapa `Validate Compose, Nginx and HTTP protection`:
+
+- Falha no Compose: verificar sintaxe/interpolação de `compose.yaml`.
+- Falha em pull: verificar Docker, conectividade e disponibilidade do registry.
+- `nginx -t`: mostra arquivo e linha da configuração inválida.
+- Prontidão: verificar logs do gateway/backend e resolução do alias isolado.
+- Assertion HTTP: a saída indica rota, método ou códigos observados; 502
+  sugere falha na fixture/DNS. 429 inesperado pode indicar consumo de saldo
+  em sequência ou regressão dos limites.
+- Sentinelas no log: revisar formato de logs antes de liberar o PR.
+
+Em saída normal, erro ou sinais INT/TERM, o script tenta remover somente seus
+containers e sua rede; em falhas imprime as últimas 100 linhas dos containers.
+Interrupção forçada do processo/daemon pode impedir cleanup: nesse caso,
+identifique pelo prefixo `infra-gateway-ci-` os recursos daquela execução e
+remova somente eles. Nunca use prune ou remova `proxy_net` para limpar a CI.
+Não executar o teste de taxa diretamente contra o gateway de produção.
